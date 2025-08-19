@@ -28,8 +28,8 @@ SCNN Model:
   class SCNN(nn.Module):
       def __init__(self, input_size):
           super(SCNN, self).__init__()
-          self.features = nn.Sequential(...)  # 卷积层
-          self.classifier = nn.Sequential(...)  # 全连接层
+          self.features = nn.Sequential(...)  # Conv layers
+          self.classifier = nn.Sequential(...)  # Fully-connected layers
   ```
 Accepts 320x480 input images
 Outputs left/right lane classifications
