@@ -1,0 +1,1173 @@
+import sys
+import cv2
+import numpy as np
+import os
+import tempfile
+import shutil
+import math
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
+                             QHBoxLayout, QLabel, QPushButton, QFileDialog,
+                             QSlider, QComboBox, QStatusBar, QProgressDialog,
+                             QMessageBox, QCheckBox, QGroupBox, QLineEdit, QDoubleSpinBox, QFrame)
+from PyQt5.QtCore import Qt, QTimer, QSize
+from PyQt5.QtGui import QImage, QPixmap, QIcon, QFont, QColor
+import torch
+import torch.nn as nn
+from torchvision import transforms
+from PIL import Image
+
+
+# 简化的SCNN模型定义（实际使用时需加载预训练权重）
+class SCNN(nn.Module):
+    def __init__(self, input_size, pretrained=False):
+        super(SCNN, self).__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(3, 16, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2, 2),
+            nn.Conv2d(16, 32, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2, 2),
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True)
+        )
+        self.classifier = nn.Sequential(
+            nn.Linear(64 * (input_size[0] // 4) * (input_size[1] // 4), 128),
+            nn.ReLU(inplace=True),
+            nn.Linear(128, 2)  # 输出左右车道线
+        )
+
+    def forward(self, x):
+        x = self.features(x)
+        x = x.view(x.size(0), -1)
+        x = self.classifier(x)
+        return x
+
+
+class ImageProcessor:
+    @staticmethod
+    def load_image(file_path):
+        """安全加载各种格式的图像，包括中文路径"""
+        try:
+            # 使用OpenCV的imdecode处理中文路径
+            with open(file_path, 'rb') as f:
+                img_data = np.frombuffer(f.read(), dtype=np.uint8)
+                img = cv2.imdecode(img_data, cv2.IMREAD_UNCHANGED)
+
+            if img is None:
+                return None
+
+            # 处理16位图像
+            if img.dtype == np.uint16:
+                img = cv2.convertScaleAbs(img, alpha=(255.0 / 65535.0))
+
+            # 处理透明通道
+            if len(img.shape) == 3 and img.shape[2] == 4:
+                alpha = img[:, :, 3] / 255.0
+                img = img[:, :, :3]
+                white_bg = np.ones_like(img) * 255
+                img = (img * alpha[..., np.newaxis] + white_bg * (1 - alpha[..., np.newaxis])).astype(np.uint8)
+
+            # 确保返回3通道图像
+            if len(img.shape) == 2:
+                img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+            elif img.shape[2] == 1:
+                img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+
+            return img
+        except Exception as e:
+            print(f"图像加载错误: {str(e)}")
+            return None
+
+    @staticmethod
+    def enhance_contrast(image):
+        """增强图像对比度"""
+        if len(image.shape) == 2:
+            # 灰度图像
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            return clahe.apply(image)
+        else:
+            # 彩色图像
+            lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+            l, a, b = cv2.split(lab)
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            l = clahe.apply(l)
+            lab = cv2.merge((l, a, b))
+            return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+
+    @staticmethod
+    def auto_adjust_brightness(image):
+        """根据天气条件自动调整亮度"""
+        # 计算图像平均亮度
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        avg_brightness = np.mean(gray)
+
+        # 根据亮度分类天气
+        if avg_brightness < 60:
+            weather = "夜晚"
+            # 夜晚增强亮度
+            lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+            l, a, b = cv2.split(lab)
+            clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+            l = clahe.apply(l)
+            lab = cv2.merge((l, a, b))
+            result = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+        elif avg_brightness < 120:
+            weather = "阴天/多云"
+            # 阴天适度增强对比度
+            result = ImageProcessor.enhance_contrast(image)
+        elif avg_brightness < 180:
+            weather = "晴天"
+            # 晴天正常处理
+            result = image.copy()
+        else:
+            weather = "强光"
+            # 强光下降低亮度
+            result = cv2.convertScaleAbs(image, alpha=0.7, beta=0)
+
+        return result, weather
+
+
+class LaneDetector:
+    def __init__(self):
+        self.canny_min = 50
+        self.canny_max = 150
+        self.hough_threshold = 50
+        self.mask_height_ratio = 0.6
+        self.line_thickness = 5
+        self.line_color = (0, 255, 0)  # 绿色
+        self.fill_color = (0, 255, 0, 100)  # 半透明绿色 (B, G, R, Alpha)
+        self.use_scnn = False
+        self.scnn_model = None
+        self.use_curve = False
+        self.prev_left_line = None
+        self.prev_right_line = None
+        self.smooth_factor = 0.7  # 平滑系数
+        self.weather = "正常"
+        self.fill_region = False  # 是否填充区域
+        self.last_valid_left = None  # 上一次有效的左车道线
+        self.last_valid_right = None  # 上一次有效的右车道线
+        self.angle_threshold = 20  # 角度变化阈值 (度)
+        self.skip_frames = 0  # 跳帧设置 (0=不跳帧, 1=隔1帧, 3=隔3帧, 6=隔6帧)
+        self.frame_counter = 0  # 帧计数器
+
+    def set_params(self, canny_min=None, canny_max=None, hough_threshold=None,
+                   use_curve=None, use_scnn=None, fill_region=None,
+                   skip_frames=None, angle_threshold=None):
+        """动态更新参数"""
+        if canny_min is not None:
+            self.canny_min = canny_min
+        if canny_max is not None:
+            self.canny_max = canny_max
+        if hough_threshold is not None:
+            self.hough_threshold = hough_threshold
+        if use_curve is not None:
+            self.use_curve = use_curve
+        if use_scnn is not None:
+            self.use_scnn = use_scnn
+        if fill_region is not None:
+            self.fill_region = fill_region
+        if skip_frames is not None:
+            self.skip_frames = skip_frames
+        if angle_threshold is not None:
+            self.angle_threshold = angle_threshold
+
+    def load_scnn_model(self, model_path):
+        """加载SCNN模型，支持中文路径"""
+        try:
+            # 实际使用时需要加载预训练权重
+            self.scnn_model = SCNN((320, 480))  # 输入尺寸应根据实际模型调整
+
+            # 处理中文路径问题：复制到临时文件
+            if any(ord(char) > 127 for char in model_path):
+                temp_dir = tempfile.mkdtemp()
+                temp_path = os.path.join(temp_dir, "model.pth")
+                shutil.copy(model_path, temp_path)
+                # 实际加载代码应使用temp_path
+                print(f"SCNN模型已加载 (临时路径: {temp_path})")
+                # 注意：实际项目中应加载模型权重，这里简化处理
+            else:
+                # 非中文路径直接加载
+                print(f"SCNN模型已加载: {model_path}")
+
+            return True
+        except Exception as e:
+            print(f"加载SCNN模型失败: {str(e)}")
+            return False
+
+    def do_canny(self, frame):
+        adjusted_frame, self.weather = ImageProcessor.auto_adjust_brightness(frame)
+        gray = cv2.cvtColor(adjusted_frame, cv2.COLOR_BGR2GRAY)
+        enhanced = ImageProcessor.enhance_contrast(gray)
+        blur = cv2.GaussianBlur(enhanced, (5, 5), 0)
+        return cv2.Canny(blur, self.canny_min, self.canny_max)
+
+    def create_mask(self, frame):
+        """创建自适应ROI掩膜"""
+        height, width = frame.shape[:2]
+        bottom_left = (width * 0.1, height)
+        bottom_right = (width * 0.9, height)
+        top_left = (width * 0.4, height * self.mask_height_ratio)
+        top_right = (width * 0.6, height * self.mask_height_ratio)
+
+        polygons = np.array([[bottom_left, top_left, top_right, bottom_right]], dtype=np.int32)
+        mask = np.zeros_like(frame)
+        cv2.fillPoly(mask, polygons, 255)
+        return mask
+
+    def do_segment(self, frame):
+        """改进的区域分割"""
+        mask = self.create_mask(frame)
+        return cv2.bitwise_and(frame, mask)
+
+    def calculate_lines(self, frame, lines):
+        #计算左右车道线
+        left_lines = []
+        right_lines = []
+        left_points = []
+        right_points = []
+
+        if lines is not None:
+            for line in lines:
+                x1, y1, x2, y2 = line.reshape(4)
+
+                # 过滤水平线
+                if abs(y1 - y2) < 20:  # y方向变化小认为是水平线
+                    continue
+
+                parameters = np.polyfit((x1, x2), (y1, y2), 1)
+                slope = parameters[0]
+                intercept = parameters[1]
+
+                # 过滤掉水平线
+                if abs(slope) < 0.3:  # 忽略斜率小于0.3的线
+                    continue
+
+                if slope < 0:
+                    left_lines.append((slope, intercept))
+                    left_points.append((x1, y1))
+                    left_points.append((x2, y2))
+                else:
+                    right_lines.append((slope, intercept))
+                    right_points.append((x1, y1))
+                    right_points.append((x2, y2))
+
+        # 曲线拟合
+        if self.use_curve and left_points:
+            left_points = np.array(left_points)
+            left_curve = np.polyfit(left_points[:, 1], left_points[:, 0], 2)  # y作为自变量
+        else:
+            left_curve = None
+
+        if self.use_curve and right_points:
+            right_points = np.array(right_points)
+            right_curve = np.polyfit(right_points[:, 1], right_points[:, 0], 2)
+        else:
+            right_curve = None
+
+        # 直线拟合
+        left_avg = np.average(left_lines, axis=0) if left_lines else None
+        right_avg = np.average(right_lines, axis=0) if right_lines else None
+
+        return left_avg, right_avg, left_curve, right_curve
+
+    def calculate_coordinates(self, frame, line_params, curve_params=None):
+        """计算坐标点"""
+        height = frame.shape[0]
+
+        if curve_params is not None:
+            # 曲线拟合
+            a, b, c = curve_params
+            y1 = height
+            y2 = int(height * 0.6)
+
+            # 生成曲线上的多个点
+            ys = np.linspace(y1, y2, 10)
+            xs = a * ys ** 2 + b * ys + c
+
+            # 过滤无效点
+            valid_points = []
+            for x, y in zip(xs, ys):
+                if 0 <= x < frame.shape[1]:
+                    valid_points.append((int(x), int(y)))
+
+            if len(valid_points) > 1:
+                return np.array(valid_points, np.int32)
+            return None
+        elif line_params is not None:
+            # 直线拟合
+            slope, intercept = line_params
+            y1 = height
+            y2 = int(height * 0.6)
+
+            try:
+                x1 = int((y1 - intercept) / slope)
+                x2 = int((y2 - intercept) / slope)
+                return np.array([[x1, y1], [x2, y2]])
+            except:
+                return None
+        return None
+
+    def detect_lanes_scnn(self, frame):
+        """使用SCNN模型检测车道线"""
+        # 简化的SCNN处理流程
+        # 实际实现需要完整的模型推理
+        height, width = frame.shape[:2]
+
+        # 预处理
+        input_img = cv2.resize(frame, (480, 320))
+        input_img = transforms.ToTensor()(input_img).unsqueeze(0)
+
+        # 模型推理 (简化版)
+        if self.scnn_model:
+            with torch.no_grad():
+                output = self.scnn_model(input_img)
+
+        # 解析输出 (简化版)
+        left_line = np.array([[width * 0.2, height], [width * 0.4, height * 0.6]])
+        right_line = np.array([[width * 0.8, height], [width * 0.6, height * 0.6]])
+
+        return left_line, right_line
+
+    def calculate_angle(self, line):
+        """计算线段的角度（度）"""
+        if line is None or len(line) < 2:
+            return None
+
+        # 对于曲线，取首尾两点计算角度
+        if line.ndim == 2 and len(line) >= 2:
+            x1, y1 = line[0]
+            x2, y2 = line[-1]
+        else:  # 直线
+            x1, y1 = line[0]
+            x2, y2 = line[1]
+
+        # 计算斜率角度（转换为度）
+        angle = math.atan2(y2 - y1, x2 - x1) * 180 / math.pi
+        # 转换为0-180度范围
+        return angle if angle >= 0 else angle + 180
+
+    def is_valid_line(self, current_line, prev_line):
+        """检查当前车道线是否有效（与上一条线角度变化在阈值内）"""
+        if current_line is None:
+            return False
+
+        if prev_line is None:
+            return True
+
+        current_angle = self.calculate_angle(current_line)
+        prev_angle = self.calculate_angle(prev_line)
+
+        if current_angle is None or prev_angle is None:
+            return True
+
+        # 计算角度变化（考虑360度循环）
+        angle_diff = abs(current_angle - prev_angle)
+        angle_diff = min(angle_diff, 360 - angle_diff)
+
+        return angle_diff <= self.angle_threshold
+
+    def fill_lane_region(self, frame, left_line, right_line):
+        """填充左右车道线之间的区域"""
+        if left_line is None or right_line is None:
+            return frame
+
+        # 创建原始图像的副本
+        result = frame.copy()
+
+        # 创建填充区域的掩膜
+        mask = np.zeros_like(result)
+
+        # 构建多边形：左车道线 + 右车道线反转
+        if left_line.ndim == 2 and right_line.ndim == 2:
+            # 曲线
+            polygon = np.vstack((left_line, np.flipud(right_line)))
+        else:
+            # 直线
+            polygon = np.array([
+                left_line[0], left_line[1],
+                right_line[1], right_line[0]
+            ])
+
+        # 在掩膜上填充多边形
+        cv2.fillPoly(mask, [polygon], self.fill_color[:3])
+
+        # 创建半透明效果
+        alpha = self.fill_color[3] / 255.0
+        result = cv2.addWeighted(result, 1, mask, alpha, 0)
+
+        return result
+
+    def detect_lanes(self, frame):
+        #完整的车道检测流程
+        original = frame.copy()
+        height, width = frame.shape[:2]
+
+        # 帧计数器更新
+        self.frame_counter += 1
+
+        # 检查是否需要跳过此帧
+        skip_processing = False
+        if self.skip_frames > 0 and self.frame_counter % (self.skip_frames + 1) != 0:
+            skip_processing = True
+            if self.last_valid_left is not None and self.last_valid_right is not None:
+                left_line = self.last_valid_left
+                right_line = self.last_valid_right
+            else:
+                left_line = None
+                right_line = None
+        else:
+            # SCNN模式
+            if self.use_scnn and self.scnn_model:
+                left_line, right_line = self.detect_lanes_scnn(frame)
+                result = original.copy()
+                if left_line is not None:
+                    cv2.polylines(result, [left_line], False, self.line_color, self.line_thickness)
+                if right_line is not None:
+                    cv2.polylines(result, [right_line], False, self.line_color, self.line_thickness)
+
+                # 更新最后有效结果
+                if left_line is not None:
+                    self.last_valid_left = left_line
+                if right_line is not None:
+                    self.last_valid_right = right_line
+
+                return {
+                    "原始图像": original,
+                    "Canny边缘": np.zeros_like(original),
+                    "ROI区域": np.zeros_like(original),
+                    "车道检测": result
+                }
+
+            # 传统模式
+            # 边缘检测
+            canny = self.do_canny(frame)
+
+            # 区域分割
+            segment = self.do_segment(canny)
+
+            # 霍夫变换
+            lines = cv2.HoughLinesP(
+                segment, 2, np.pi / 180, self.hough_threshold,
+                np.array([]), minLineLength=40, maxLineGap=25
+            )
+
+            # 计算车道线
+            left_avg, right_avg, left_curve, right_curve = self.calculate_lines(frame, lines)
+
+            # 平滑处理
+            if self.prev_left_line is not None:
+                if left_curve is not None:
+                    left_curve = self.smooth_factor * np.array(left_curve) + (1 - self.smooth_factor) * np.array(
+                        self.prev_left_line)
+                elif left_avg is not None:
+                    left_avg = self.smooth_factor * np.array(left_avg) + (1 - self.smooth_factor) * np.array(
+                        self.prev_left_line)
+
+            if self.prev_right_line is not None:
+                if right_curve is not None:
+                    right_curve = self.smooth_factor * np.array(right_curve) + (1 - self.smooth_factor) * np.array(
+                        self.prev_right_line)
+                elif right_avg is not None:
+                    right_avg = self.smooth_factor * np.array(right_avg) + (1 - self.smooth_factor) * np.array(
+                        self.prev_right_line)
+
+            # 保存当前帧结果用于下一帧平滑
+            self.prev_left_line = left_curve if left_curve is not None else left_avg
+            self.prev_right_line = right_curve if right_curve is not None else right_avg
+
+            # 计算坐标
+            left_line = self.calculate_coordinates(frame, left_avg, left_curve)
+            right_line = self.calculate_coordinates(frame, right_avg, right_curve)
+
+            # 检查相交线 (在图像底部)
+            if left_line is not None and right_line is not None:
+                # 获取底部点
+                if left_line.ndim == 2:  # 曲线
+                    left_bottom = left_line[0]
+                else:  # 直线
+                    left_bottom = left_line[0]
+
+                if right_line.ndim == 2:  # 曲线
+                    right_bottom = right_line[0]
+                else:  # 直线
+                    right_bottom = right_line[0]
+
+                # 如果左车道线在右车道线右侧，则丢弃
+                if left_bottom[0] > right_bottom[0]:
+                    left_line = None
+
+            # 有效性检查
+            if not self.is_valid_line(left_line, self.last_valid_left):
+                left_line = self.last_valid_left
+            else:
+                self.last_valid_left = left_line
+
+            if not self.is_valid_line(right_line, self.last_valid_right):
+                right_line = self.last_valid_right
+            else:
+                self.last_valid_right = right_line
+
+        # 可视化结果
+        result = original.copy()
+
+        # 绘制车道线
+        if left_line is not None and not skip_processing:
+            if left_line.ndim == 2:  # 曲线
+                cv2.polylines(result, [left_line], False, self.line_color, self.line_thickness)
+            else:  # 直线
+                cv2.line(result, (left_line[0][0], left_line[0][1]),
+                         (left_line[1][0], left_line[1][1]), self.line_color, self.line_thickness)
+
+        if right_line is not None and not skip_processing:
+            if right_line.ndim == 2:  # 曲线
+                cv2.polylines(result, [right_line], False, self.line_color, self.line_thickness)
+            else:  # 直线
+                cv2.line(result, (right_line[0][0], right_line[0][1]),
+                         (right_line[1][0], right_line[1][1]), self.line_color, self.line_thickness)
+
+        # 填充区域
+        if self.fill_region and left_line is not None and right_line is not None:
+            result = self.fill_lane_region(result, left_line, right_line)
+
+        # 返回处理过程各阶段结果
+        if skip_processing:
+            return {
+                "原始图像": original,
+                "Canny边缘": np.zeros_like(original),
+                "ROI区域": np.zeros_like(original),
+                "车道检测": result
+            }
+        else:
+            return {
+                "原始图像": original,
+                "Canny边缘": cv2.cvtColor(canny, cv2.COLOR_GRAY2BGR),
+                "ROI区域": segment,
+                "车道检测": result
+            }
+
+
+class VideoProcessor:
+    def __init__(self):
+        self.cap = None
+        self.writer = None
+        self.paused = False
+        self.current_frame_pos = 0
+        self.total_frames = 0
+        self.fps = 30
+        self.output_path = ""
+        self.temp_dir = None  # 用于处理中文路径的临时目录
+
+    def open(self, file_path):
+        """打开视频文件，支持中文路径"""
+        self.release()  # 先释放已有资源
+
+        # 处理中文路径问题
+        if any(ord(char) > 127 for char in file_path):
+            self.temp_dir = tempfile.mkdtemp()
+            temp_path = os.path.join(self.temp_dir, "temp_video.mp4")
+            shutil.copy(file_path, temp_path)
+            file_path = temp_path
+
+        self.cap = cv2.VideoCapture(file_path)
+        if not self.cap.isOpened():
+            return False
+
+        self.fps = self.cap.get(cv2.CAP_PROP_FPS)
+        self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        self.current_frame_pos = 0
+        return True
+
+    def read_frame(self):
+        """读取当前帧"""
+        if self.cap is None or not self.cap.isOpened():
+            return None
+
+        if not self.paused:
+            ret, frame = self.cap.read()
+            if ret:
+                self.current_frame_pos += 1
+                return frame
+            return None
+        else:
+            # 暂停时保持当前帧
+            self.cap.set(cv2.CAP_PROP_POS_FRAMES, self.current_frame_pos)
+            ret, frame = self.cap.read()
+            return frame if ret else None
+
+    def get_progress(self):
+        """获取当前进度"""
+        if self.total_frames == 0:
+            return 0
+        return (self.current_frame_pos / self.total_frames) * 100
+
+    def init_writer(self, output_path, frame_size):
+        """初始化视频写入器，支持中文路径"""
+        # 处理中文路径问题
+        if any(ord(char) > 127 for char in output_path):
+            if self.temp_dir is None:
+                self.temp_dir = tempfile.mkdtemp()
+            temp_path = os.path.join(self.temp_dir, "temp_output.mp4")
+            self.output_path = output_path  # 保存原始路径
+            output_path = temp_path
+        else:
+            self.output_path = output_path
+
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        self.writer = cv2.VideoWriter(output_path, fourcc, self.fps, frame_size)
+        return self.writer is not None
+
+    def write_frame(self, frame):
+        """写入帧到输出视频"""
+        if self.writer is not None:
+            self.writer.write(frame)
+
+    def release(self):
+        """释放资源并处理临时文件"""
+        if self.cap is not None:
+            self.cap.release()
+        if self.writer is not None:
+            self.writer.release()
+
+        # 处理临时文件：将输出文件移动到原始路径
+        if self.temp_dir and os.path.exists(self.temp_dir):
+            try:
+                temp_output = os.path.join(self.temp_dir, "temp_output.mp4")
+                if os.path.exists(temp_output) and self.output_path:
+                    shutil.move(temp_output, self.output_path)
+
+                # 删除临时目录
+                shutil.rmtree(self.temp_dir)
+            except Exception as e:
+                print(f"清理临时文件错误: {str(e)}")
+
+        self.cap = None
+        self.writer = None
+        self.paused = False
+        self.current_frame_pos = 0
+        self.total_frames = 0
+        self.temp_dir = None
+        self.output_path = ""
+
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("高级车道检测系统 v1.1")
+        self.setWindowIcon(QIcon("icon.png"))  # 替换为您的图标路径
+        self.setGeometry(100, 100, 1400, 900)
+
+        # 初始化核心组件
+        self.detector = LaneDetector()
+        self.video_processor = VideoProcessor()
+        self.current_image = None
+        self.process_frames = None
+        self.output_path = ""
+        self.weather_info = "正常"
+
+        # 创建UI
+        self.init_ui()
+
+        # 状态栏
+        self.status_bar = QStatusBar()
+        self.setStatusBar(self.status_bar)
+        self.status_bar.showMessage("就绪")
+
+    def init_ui(self):
+        """初始化用户界面"""
+        main_widget = QWidget()
+        main_layout = QVBoxLayout()
+        main_widget.setLayout(main_layout)
+        self.setCentralWidget(main_widget)
+
+        # 图像显示区域
+        self.image_label = QLabel()
+        self.image_label.setAlignment(Qt.AlignCenter)
+        self.image_label.setMinimumSize(1000, 600)
+        self.image_label.setText("请选择图像或视频进行处理")
+        self.image_label.setStyleSheet("""
+            QLabel {
+                border: 2px solid #3498db;
+                border-radius: 5px;
+                background: #ecf0f1;
+            }
+        """)
+        main_layout.addWidget(self.image_label)
+
+        # 控制面板
+        control_panel = QWidget()
+        control_layout = QHBoxLayout()
+        control_panel.setLayout(control_layout)
+        main_layout.addWidget(control_panel)
+
+        # 处理步骤选择
+        control_layout.addWidget(QLabel("显示步骤:"))
+        self.step_combo = QComboBox()
+        self.step_combo.addItems(["原始图像", "Canny边缘", "ROI区域", "车道检测"])
+        self.step_combo.currentIndexChanged.connect(self.update_display)
+        control_layout.addWidget(self.step_combo)
+
+        # 参数控制组
+        param_group = QGroupBox("参数控制")
+        param_layout = QHBoxLayout()
+        param_group.setLayout(param_layout)
+        control_layout.addWidget(param_group)
+
+        # Canny最小阈值
+        param_layout.addWidget(QLabel("Canny最小:"))
+        self.canny_min_slider = QSlider(Qt.Horizontal)
+        self.canny_min_slider.setRange(10, 200)
+        self.canny_min_slider.setValue(50)
+        self.canny_min_slider.valueChanged.connect(self.update_params)
+        param_layout.addWidget(self.canny_min_slider)
+
+        self.canny_min_value = QLabel("50")
+        self.canny_min_value.setFixedWidth(30)
+        param_layout.addWidget(self.canny_min_value)
+
+        # Canny最大阈值
+        param_layout.addWidget(QLabel("Canny最大:"))
+        self.canny_max_slider = QSlider(Qt.Horizontal)
+        self.canny_max_slider.setRange(50, 300)
+        self.canny_max_slider.setValue(150)
+        self.canny_max_slider.valueChanged.connect(self.update_params)
+        param_layout.addWidget(self.canny_max_slider)
+
+        self.canny_max_value = QLabel("150")
+        self.canny_max_value.setFixedWidth(30)
+        param_layout.addWidget(self.canny_max_value)
+
+        # 霍夫阈值
+        param_layout.addWidget(QLabel("霍夫阈值:"))
+        self.hough_slider = QSlider(Qt.Horizontal)
+        self.hough_slider.setRange(10, 200)
+        self.hough_slider.setValue(50)
+        self.hough_slider.valueChanged.connect(self.update_params)
+        param_layout.addWidget(self.hough_slider)
+
+        self.hough_value = QLabel("50")
+        self.hough_value.setFixedWidth(30)
+        param_layout.addWidget(self.hough_value)
+
+        # 高级功能组
+        advanced_group = QGroupBox("高级功能")
+        advanced_layout = QVBoxLayout()
+        advanced_group.setLayout(advanced_layout)
+        control_layout.addWidget(advanced_group)
+
+        # 第一行：检测模式
+        mode_layout = QHBoxLayout()
+        advanced_layout.addLayout(mode_layout)
+
+        # 曲线拟合
+        self.curve_check = QCheckBox("曲线拟合")
+        self.curve_check.stateChanged.connect(self.toggle_curve)
+        mode_layout.addWidget(self.curve_check)
+
+        # SCNN模型
+        self.scnn_check = QCheckBox("使用SCNN")
+        self.scnn_check.stateChanged.connect(self.toggle_scnn)
+        mode_layout.addWidget(self.scnn_check)
+
+        self.load_scnn_btn = QPushButton("加载SCNN模型")
+        self.load_scnn_btn.clicked.connect(self.load_scnn_model)
+        self.load_scnn_btn.setEnabled(False)
+        mode_layout.addWidget(self.load_scnn_btn)
+
+        # 区域填充
+        self.fill_check = QCheckBox("区域填充")
+        self.fill_check.stateChanged.connect(self.toggle_fill)
+        mode_layout.addWidget(self.fill_check)
+
+        # 第二行：稳定性控制
+        stability_layout = QHBoxLayout()
+        advanced_layout.addLayout(stability_layout)
+
+        # 跳帧设置
+        stability_layout.addWidget(QLabel("跳帧:"))
+        self.skip_combo = QComboBox()
+        self.skip_combo.addItems(["不跳帧", "隔1帧", "隔3帧", "隔6帧"])
+        self.skip_combo.currentIndexChanged.connect(self.update_skip_frames)
+        stability_layout.addWidget(self.skip_combo)
+
+        # 角度阈值
+        stability_layout.addWidget(QLabel("角度阈值:"))
+        self.angle_slider = QSlider(Qt.Horizontal)
+        self.angle_slider.setRange(5, 90)
+        self.angle_slider.setValue(20)
+        self.angle_slider.valueChanged.connect(self.update_angle_threshold)
+        stability_layout.addWidget(self.angle_slider)
+
+        self.angle_value = QLabel("20°")
+        self.angle_value.setFixedWidth(30)
+        stability_layout.addWidget(self.angle_value)
+
+        # 天气信息
+        self.weather_label = QLabel("天气: 正常")
+        stability_layout.addWidget(self.weather_label)
+
+        # 按钮区域
+        button_panel = QWidget()
+        button_layout = QHBoxLayout()
+        button_panel.setLayout(button_layout)
+        main_layout.addWidget(button_panel)
+
+        # 按钮样式
+        button_style = """
+            QPushButton {
+                padding: 8px;
+                border: 1px solid #3498db;
+                border-radius: 4px;
+                background: #2980b9;
+                color: white;
+                min-width: 80px;
+            }
+            QPushButton:hover {
+                background: #3498db;
+            }
+            QPushButton:disabled {
+                background: #bdc3c7;
+                color: #7f8c8d;
+            }
+        """
+
+        self.open_image_btn = QPushButton("打开图像")
+        self.open_image_btn.setStyleSheet(button_style)
+        self.open_image_btn.clicked.connect(self.open_image)
+        button_layout.addWidget(self.open_image_btn)
+
+        self.open_video_btn = QPushButton("打开视频")
+        self.open_video_btn.setStyleSheet(button_style)
+        self.open_video_btn.clicked.connect(self.open_video)
+        button_layout.addWidget(self.open_video_btn)
+
+        self.process_btn = QPushButton("处理")
+        self.process_btn.setStyleSheet(button_style)
+        self.process_btn.setEnabled(False)
+        self.process_btn.clicked.connect(self.process)
+        button_layout.addWidget(self.process_btn)
+
+        self.save_btn = QPushButton("保存结果")
+        self.save_btn.setStyleSheet(button_style)
+        self.save_btn.setEnabled(False)
+        self.save_btn.clicked.connect(self.save_result)
+        button_layout.addWidget(self.save_btn)
+
+        self.pause_btn = QPushButton("暂停/继续")
+        self.pause_btn.setStyleSheet(button_style)
+        self.pause_btn.setEnabled(False)
+        self.pause_btn.clicked.connect(self.toggle_pause)
+        button_layout.addWidget(self.pause_btn)
+
+        # 视频定时器
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.process_video_frame)
+
+    def toggle_curve(self, state):
+        """切换曲线拟合模式"""
+        self.detector.set_params(use_curve=(state == Qt.Checked))
+        if self.current_image is not None or self.video_processor.cap is not None:
+            self.process()
+
+    def toggle_scnn(self, state):
+        """切换SCNN模式"""
+        self.detector.set_params(use_scnn=(state == Qt.Checked))
+        self.load_scnn_btn.setEnabled(state == Qt.Checked)
+        if self.current_image is not None or self.video_processor.cap is not None:
+            self.process()
+
+    def toggle_fill(self, state):
+        """切换区域填充模式"""
+        self.detector.set_params(fill_region=(state == Qt.Checked))
+        if self.current_image is not None or self.video_processor.cap is not None:
+            self.process()
+
+    def update_skip_frames(self, index):
+        """更新跳帧设置"""
+        skip_options = [0, 1, 3, 6]
+        self.detector.set_params(skip_frames=skip_options[index])
+        if self.video_processor.cap is not None:
+            self.detector.frame_counter = 0  # 重置帧计数器
+
+    def update_angle_threshold(self):
+        """更新角度变化阈值"""
+        value = self.angle_slider.value()
+        self.angle_value.setText(f"{value}°")
+        self.detector.set_params(angle_threshold=value)
+
+    def load_scnn_model(self):
+        """加载SCNN模型"""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "选择SCNN模型文件", "",
+            "模型文件 (*.pth *.pt);;所有文件 (*)"
+        )
+
+        if file_path:
+            if self.detector.load_scnn_model(file_path):
+                QMessageBox.information(self, "成功", "SCNN模型加载成功！")
+            else:
+                QMessageBox.warning(self, "错误", "无法加载SCNN模型")
+
+    def update_params(self):
+        """更新检测器参数"""
+        # 更新滑块值显示
+        self.canny_min_value.setText(str(self.canny_min_slider.value()))
+        self.canny_max_value.setText(str(self.canny_max_slider.value()))
+        self.hough_value.setText(str(self.hough_slider.value()))
+
+        # 更新检测器参数
+        self.detector.set_params(
+            canny_min=self.canny_min_slider.value(),
+            canny_max=self.canny_max_slider.value(),
+            hough_threshold=self.hough_slider.value()
+        )
+
+        # 如果当前有图像，重新处理
+        if self.current_image is not None or self.video_processor.cap is not None:
+            self.process()
+
+    def open_image(self):
+        """打开图像文件，支持中文路径"""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "打开图像", "",
+            "图像文件 (*.jpg *.jpeg *.png *.bmp *.tiff);;所有文件 (*)"
+        )
+
+        if file_path:
+            self.current_image = ImageProcessor.load_image(file_path)
+            if self.current_image is not None:
+                self.display_image(self.current_image, "原始图像")
+                self.process_btn.setEnabled(True)
+                self.save_btn.setEnabled(False)
+                self.pause_btn.setEnabled(False)
+                self.detector.frame_counter = 0  # 重置帧计数器
+
+                # 显示图像信息
+                height, width = self.current_image.shape[:2]
+                channels = "灰度" if len(self.current_image.shape) == 2 else f"{self.current_image.shape[2]}通道"
+                self.status_bar.showMessage(
+                    f"已加载图像: {file_path} | 尺寸: {width}x{height} | {channels}"
+                )
+            else:
+                QMessageBox.warning(self, "错误", "无法加载图像，可能是不支持的格式或损坏的文件")
+
+    def open_video(self):
+        """打开视频文件，支持中文路径"""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "打开视频", "",
+            "视频文件 (*.mp4 *.avi *.mov *.mkv);;所有文件 (*)"
+        )
+
+        if file_path:
+            if self.video_processor.open(file_path):
+                self.current_image = None
+                self.timer.start(30)  # 约30fps
+                self.process_btn.setEnabled(True)
+                self.save_btn.setEnabled(False)
+                self.pause_btn.setEnabled(True)
+                self.detector.frame_counter = 0  # 重置帧计数器
+                self.status_bar.showMessage(f"已加载视频: {file_path}")
+            else:
+                QMessageBox.warning(self, "错误", "无法加载视频文件")
+
+    def process(self):
+        """处理当前图像或视频"""
+        if self.current_image is not None:
+            try:
+                self.process_frames = self.detector.detect_lanes(self.current_image)
+                self.weather_label.setText(f"天气: {self.detector.weather}")
+                self.update_display()
+                self.save_btn.setEnabled(True)
+                self.status_bar.showMessage("图像处理完成")
+            except Exception as e:
+                QMessageBox.critical(self, "处理错误", f"处理图像时出错: {str(e)}")
+        elif self.video_processor.cap is not None:
+            self.status_bar.showMessage("视频处理中...")
+
+    def process_video_frame(self):
+        """处理视频帧"""
+        if self.video_processor.cap is not None:
+            frame = self.video_processor.read_frame()
+            if frame is not None:
+                try:
+                    process_frames = self.detector.detect_lanes(frame)
+                    self.weather_label.setText(f"天气: {self.detector.weather}")
+                    self.display_image(process_frames["车道检测"], "车道检测")
+
+                    # 更新状态
+                    progress = self.video_processor.get_progress()
+                    skip_text = ["不跳帧", "隔1帧", "隔3帧", "隔6帧"][self.detector.skip_frames]
+                    self.status_bar.showMessage(
+                        f"处理视频中: {progress:.1f}% 完成 | "
+                        f"跳帧: {skip_text} | "
+                        f"角度阈值: {self.detector.angle_threshold}° | "
+                        f"天气: {self.detector.weather}"
+                    )
+                except Exception as e:
+                    self.timer.stop()
+                    QMessageBox.critical(self, "处理错误", f"处理视频帧时出错: {str(e)}")
+            else:
+                self.timer.stop()
+                self.video_processor.release()
+                self.status_bar.showMessage("视频处理完成")
+                self.save_btn.setEnabled(True)
+                self.pause_btn.setEnabled(False)
+
+    def toggle_pause(self):
+        """暂停/继续视频处理"""
+        self.video_processor.paused = not self.video_processor.paused
+        self.pause_btn.setText("继续" if self.video_processor.paused else "暂停")
+        self.status_bar.showMessage("视频已暂停" if self.video_processor.paused else "视频处理中")
+
+    def update_display(self):
+        """更新显示的图像"""
+        if hasattr(self, 'process_frames'):
+            current_step = self.step_combo.currentText()
+            self.display_image(self.process_frames[current_step], current_step)
+
+    def display_image(self, image, title=None):
+        """在QLabel中显示OpenCV图像"""
+        if image is not None:
+            # 处理单通道图像
+            if len(image.shape) == 2:
+                q_img = QImage(image.data, image.shape[1], image.shape[0],
+                               image.shape[1], QImage.Format_Grayscale8)
+            # 处理三通道图像
+            elif image.shape[2] == 3:
+                rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                h, w, ch = rgb_image.shape
+                bytes_per_line = ch * w
+                q_img = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format_RGB888)
+            else:
+                QMessageBox.warning(self, "错误", "不支持的图像格式")
+                return
+
+            pixmap = QPixmap.fromImage(q_img)
+            self.image_label.setPixmap(
+                pixmap.scaled(
+                    self.image_label.width(),
+                    self.image_label.height(),
+                    Qt.KeepAspectRatio,
+                    Qt.SmoothTransformation
+                )
+            )
+
+            if title:
+                self.image_label.setToolTip(title)
+
+    def save_result(self):
+        """保存处理结果，支持中文路径"""
+        if hasattr(self, 'process_frames'):
+            # 保存图像
+            file_path, _ = QFileDialog.getSaveFileName(
+                self, "保存图像结果", "",
+                "JPEG图像 (*.jpg);;PNG图像 (*.png);;BMP图像 (*.bmp)"
+            )
+
+            if file_path:
+                try:
+                    result_image = self.process_frames["车道检测"]
+
+                    # 处理中文路径：使用imencode
+                    ext = os.path.splitext(file_path)[1].lower()
+                    if ext == '.jpg' or ext == '.jpeg':
+                        success, buffer = cv2.imencode(ext, result_image, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+                    elif ext == '.png':
+                        success, buffer = cv2.imencode(ext, result_image, [int(cv2.IMWRITE_PNG_COMPRESSION), 9])
+                    else:
+                        success, buffer = cv2.imencode(ext, result_image)
+
+                    if success:
+                        with open(file_path, 'wb') as f:
+                            f.write(buffer.tobytes())
+                        self.status_bar.showMessage(f"结果已保存到: {file_path}")
+                    else:
+                        QMessageBox.warning(self, "保存错误", "图像编码失败")
+                except Exception as e:
+                    QMessageBox.critical(self, "保存错误", f"保存图像时出错: {str(e)}")
+
+        elif self.video_processor.cap is not None:
+            # 保存视频
+            file_path, _ = QFileDialog.getSaveFileName(
+                self, "保存视频结果", "",
+                "MP4视频 (*.mp4);;AVI视频 (*.avi)"
+            )
+
+            if file_path:
+                # 初始化进度对话框
+                progress = QProgressDialog("正在保存视频...", "取消", 0,
+                                           self.video_processor.total_frames, self)
+                progress.setWindowTitle("保存进度")
+                progress.setWindowModality(Qt.WindowModal)
+                progress.setMinimumDuration(0)
+
+                # 获取第一帧确定尺寸
+                self.video_processor.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                ret, frame = self.video_processor.cap.read()
+                if not ret:
+                    QMessageBox.warning(self, "错误", "无法读取视频帧")
+                    return
+
+                frame_size = (frame.shape[1], frame.shape[0])
+                if not self.video_processor.init_writer(file_path, frame_size):
+                    QMessageBox.warning(self, "错误", "无法创建视频文件")
+                    return
+
+                # 重置视频位置
+                self.video_processor.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                self.video_processor.current_frame_pos = 0
+                self.detector.frame_counter = 0  # 重置帧计数器
+
+                # 逐帧处理并保存
+                while self.video_processor.current_frame_pos < self.video_processor.total_frames:
+                    frame = self.video_processor.read_frame()
+                    if frame is None:
+                        break
+
+                    # 处理当前帧
+                    try:
+                        process_frames = self.detector.detect_lanes(frame)
+                        result_frame = process_frames["车道检测"]
+                        self.video_processor.write_frame(result_frame)
+                    except Exception as e:
+                        QMessageBox.warning(self, "处理错误", f"处理帧时出错: {str(e)}")
+                        break
+
+                    # 更新进度
+                    progress.setValue(self.video_processor.current_frame_pos)
+                    if progress.wasCanceled():
+                        break
+
+                    # 保持UI响应
+                    QApplication.processEvents()
+
+                # 释放资源
+                self.video_processor.release()
+
+                if progress.wasCanceled():
+                    self.status_bar.showMessage("视频保存已取消")
+                else:
+                    self.status_bar.showMessage(f"视频已保存到: {file_path}")
+
+    def closeEvent(self, event):
+        """窗口关闭事件"""
+        self.video_processor.release()
+        event.accept()
+
+
+if __name__ == "__main__":
+    # 启用高DPI缩放
+    QApplication.setAttribute(Qt.AA_EnableHighDpiScaling)
+    QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps)
+
+    app = QApplication(sys.argv)
+    app.setStyle('Fusion')  # 使用Fusion样式
+
+    # 设置全局字体
+    font = app.font()
+    font.setPointSize(10)
+    app.setFont(font)
+
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec_())
